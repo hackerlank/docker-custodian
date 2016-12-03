@@ -4,6 +4,7 @@ Remove old docker containers and images that are no longer in use.
 
 """
 import argparse
+import fnmatch
 import logging
 import sys
 
@@ -25,7 +26,8 @@ def cleanup_containers(client, max_container_age, dry_run):
     all_containers = get_all_containers(client)
 
     for container_summary in reversed(all_containers):
-        container = api_call(client.inspect_container, container_summary['Id'])
+        container = api_call(client.inspect_container,
+                             container=container_summary['Id'])
         if not container or not should_remove_container(container,
                                                         max_container_age):
             continue
@@ -36,7 +38,8 @@ def cleanup_containers(client, max_container_age, dry_run):
             container['State']['FinishedAt']))
 
         if not dry_run:
-            api_call(client.remove_container, container['Id'])
+            api_call(client.remove_container, container=container['Id'],
+                     v=True)
 
 
 def should_remove_container(container, min_date):
@@ -71,6 +74,13 @@ def get_all_images(client):
     return images
 
 
+def get_dangling_volumes(client):
+    log.info("Getting dangling volumes")
+    volumes = client.volumes({'dangling': True})['Volumes']
+    log.info("Found %s dangling volumes", len(volumes))
+    return volumes
+
+
 def cleanup_images(client, max_image_age, dry_run, exclude_set):
     # re-fetch container list so that we don't include removed containers
     image_tags_in_use = set(
@@ -88,7 +98,10 @@ def filter_excluded_images(images, exclude_set):
         image_tags = image_summary.get('RepoTags')
         if no_image_tags(image_tags):
             return True
-        return not set(image_tags) & exclude_set
+        for exclude_pattern in exclude_set:
+            if fnmatch.filter(image_tags, exclude_pattern):
+                return False
+        return True
 
     return filter(include_image, images)
 
@@ -116,7 +129,7 @@ def no_image_tags(image_tags):
 
 
 def remove_image(client, image_summary, min_date, dry_run):
-    image = api_call(client.inspect_image, image_summary['Id'])
+    image = api_call(client.inspect_image, image=image_summary['Id'])
     if not image or not is_image_old(image, min_date):
         return
 
@@ -127,21 +140,42 @@ def remove_image(client, image_summary, min_date, dry_run):
     image_tags = image_summary.get('RepoTags')
     # If there are no tags, remove the id
     if no_image_tags(image_tags):
-        api_call(client.remove_image, image_summary['Id'])
+        api_call(client.remove_image, image=image_summary['Id'])
         return
 
     # Remove any repository tags so we don't hit 409 Conflict
     for image_tag in image_tags:
-        api_call(client.remove_image, image_tag)
+        api_call(client.remove_image, image=image_tag)
 
 
-def api_call(func, id):
+def remove_volume(client, volume, dry_run):
+    if not volume:
+        return
+
+    log.info("Removing volume %s" % volume['Name'])
+    if dry_run:
+        return
+
+    api_call(client.remove_volume, name=volume['Name'])
+
+
+def cleanup_volumes(client, dry_run):
+    dangling_volumes = get_dangling_volumes(client)
+
+    for volume in reversed(dangling_volumes):
+        log.info("Removing dangling volume %s", volume['Name'])
+        remove_volume(client, volume, dry_run)
+
+
+def api_call(func, **kwargs):
     try:
-        return func(id)
+        return func(**kwargs)
     except requests.exceptions.Timeout as e:
-        log.warn("Failed to call %s %s %s" % (func.__name__, id, e))
+        params = ','.join('%s=%s' % item for item in kwargs.items())
+        log.warn("Failed to call %s %s %s" % (func.__name__, params, e))
     except docker.errors.APIError as ae:
-        log.warn("Error calling %s %s %s" % (func.__name__, id, ae))
+        params = ','.join('%s=%s' % item for item in kwargs.items())
+        log.warn("Error calling %s %s %s" % (func.__name__, params, ae))
 
 
 def format_image(image, image_summary):
@@ -184,6 +218,9 @@ def main():
             args.exclude_image_file)
         cleanup_images(client, args.max_image_age, args.dry_run, exclude_set)
 
+    if args.dangling_volumes:
+        cleanup_volumes(client, args.dry_run)
+
 
 def get_args(args=None):
     parser = argparse.ArgumentParser()
@@ -199,6 +236,10 @@ def get_args(args=None):
         help="Maxium age for an image. Images older than this age will be "
              "removed. Age can be specified in any pytimeparse supported "
              "format.")
+    parser.add_argument(
+        '--dangling-volumes',
+        action="store_true",
+        help="Dangling volumes will be removed.")
     parser.add_argument(
         '--dry-run', action="store_true",
         help="Only log actions, don't remove anything.")
